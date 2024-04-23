@@ -1,0 +1,10 @@
+*.pyc
+__pycache__
+.env
+.DS_Store
+venv
+*.sqlite
+.quotes_scraper.py
+quotes.ipynb
+books_v3.py
+quotes.ipynb

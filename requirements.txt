@@ -1,0 +1,7 @@
+streamlit
+psycopg2-binary
+python-dotenv
+panda
+SQLite
+pip install psycopg2
+psycopg2
