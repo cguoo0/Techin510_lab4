@@ -1,36 +1,24 @@
-import streamlit as st
 import os
-from dotenv import load_dotenv
+import logging
 import requests
 from bs4 import BeautifulSoup
-import psycopg2
+from psycopg2 import connect
+from dotenv import load_dotenv
+from tqdm import tqdm
 
+# Load environment variables
 load_dotenv()
 
-# Ensure the environment variable is loaded
-database_url = os.getenv('DATABASE_URL')
-if database_url is None:
-    raise ValueError("DATABASE_URL is not set in the environment variables")
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 
-# Establish the database connection
-conn = psycopg2.connect(database_url)
-c = conn.cursor()
+# Database connection settings
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Create table if not exists
-c.execute('''
-CREATE TABLE IF NOT EXISTS books (
-    name TEXT,
-    price TEXT,
-    rating TEXT,
-    in_stock TEXT,
-    description TEXT
-)
-''')
-conn.commit()
+# Constants
+BASE_URL = "https://books.toscrape.com"
 
-# Mapping textual ratings to numeric values
-ratings_mapping = {
-    "Zero": 0,  
+rating_map = {
     "One": 1,
     "Two": 2,
     "Three": 3,
@@ -38,83 +26,78 @@ ratings_mapping = {
     "Five": 5
 }
 
-def fetch_books(url):
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        return soup
-    except requests.RequestException as e:
-        print(f"Request failed: {e}")
-        return None
+# Function to get a database connection
+def get_db_connection():
+    return connect(DATABASE_URL)
 
-def fetch_description(url):
-    """ Fetch the product description from a book's detail page. """
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        description_block = soup.find('div', id='product_description')
-        description_text = ''
-        if description_block:
-            next_sibling = description_block.find_next_sibling('p')
-            description_text = next_sibling.text.strip() if next_sibling else "No description available"
-        return description_text
-    except requests.RequestException as e:
-        print(f"Error fetching description: {e}")
-        return "No description available"
+# Create or recreate the database table
+def setup_database():
+    with get_db_connection() as con:
+        with con.cursor() as cur:
+            # Drop the existing table if it exists
+            cur.execute("DROP TABLE IF EXISTS books")
+            # Create a new table
+            cur.execute(
+                """
+                CREATE TABLE books
+                (
+                    title TEXT NOT NULL PRIMARY KEY,
+                    price FLOAT NOT NULL,
+                    stock INT NOT NULL,
+                    rating NUMERIC NOT NULL,
+                    description TEXT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        con.commit()
+
+# Fetch all product links
+def get_product_links():
+    product_links = []
+    page = 1
+    while True:
+        response = requests.get(f"{BASE_URL}/catalogue/page-{page}.html")
+        if response.status_code != 200:
+            break
+        soup = BeautifulSoup(response.text, "html.parser")
+        links = [x['href'] for x in soup.select("ol.row li article h3 a")]
+        if not links:
+            break
+        product_links.extend(links)
+        page += 1
+    return product_links
+
+# Scrape product data and insert into the database
+def get_product(product_link):
+    response = requests.get(f"{BASE_URL}/catalogue/{product_link}")
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.select_one(".product_main > h1").text
+    price = float(soup.select_one(".price_color").text[2:])
+    stock = int(soup.select_one(".instock.availability").text.strip().split('(')[1].split()[0])
+    rating = rating_map[soup.select_one(".star-rating")['class'][1]]
+    description = soup.select_one("#product_description + p")
+    description = description.text if description else ""
     
+    with get_db_connection() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO books (title, price, stock, rating, description) 
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (title, price, stock, rating, description)
+            )
+        con.commit()
 
-def parse_books(soup, base_url):
-    if soup is None:
-        return
-
-    books = []
-    book_elements = soup.find_all('article', class_='product_pod')
-    for book in book_elements:
-        title = book.find('h3').find('a')['title']
-        price_text = book.find('p', class_='price_color').text
-        # Remove the 'Â£' symbol and convert to float
-        price = float(price_text.replace('Â£', '').strip())
-        rating_class = book.find('p', class_='star-rating')['class'][1]
-        # Convert rating word to number using the mapping
-        rating = ratings_mapping.get(rating_class, 0)
-        in_stock = book.find('p', class_='instock availability').text.strip()
-
-        # Getting the URL for each book's detail page
-        relative_link = book.find('h3').find('a')['href']
-        link = base_url + "catalogue/" + relative_link
-
-        # Fetching the book's description
-        description = fetch_description(link)
-
-        books.append((title, price, rating, in_stock, description))
-
-    # Insert all books at once
-    c.executemany('INSERT INTO books (name, price, rating, in_stock, description) VALUES (%s, %s, %s, %s, %s)', books)
-    conn.commit()
-
-def scrape_books():
-    base_url = "http://books.toscrape.com/catalogue/"
-
-    # Start scraping from the first page of book listings
-    first_page_url = base_url + "page-1.html"
-    first_page = fetch_books(first_page_url)
-    parse_books(first_page, base_url)
-
-    # Initial setup to handle pagination
-    next_button = first_page.find('li', class_='next') if first_page else None
-    page_num = 2
-    while next_button:
-        next_page_url = base_url + "page-{}.html".format(page_num)  # Properly use format for each subsequent page
-        next_page = fetch_books(next_page_url)
-        parse_books(next_page, base_url)
-        next_button = next_page.find('li', class_='next') if next_page else None
-        page_num += 1
-
-try:
-    scrape_books()
-finally:
-    conn.close()
-    print("Database connection closed.")
-
+# Main function
+if __name__ == "__main__":
+    setup_database()
+    product_links = get_product_links()
+    for link in tqdm(product_links):
+        try:
+            get_product(link)
+        except Exception as e:
+            logging.error(f"Failed to process {link}: {str(e)}")
+    print("Scraping completed")
